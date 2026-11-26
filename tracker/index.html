@@ -2218,6 +2218,137 @@ function tmChannels(m) {
       `Channels left out, with their notes: ${gone.map(([n, i]) => `${i + 1} (${n})`).join(', ')}.`] };
 }
 
+// ---------------------------------------------------------------- packing many channels into 16
+//
+// Modules with more than 16 channels mostly use few at a time: a channel
+// holds one note, so a composer spreads chords, doubled notes and echoes
+// (the same note a few rows later on the next channel, quieter) over many,
+// and each is idle most of the time. Packing cuts each pattern's channels
+// into notes, each from its row to the next note, note off or volume 0 on
+// its channel, or to the end of a sample that does not loop, and lays them
+// on 16 channels where they do not overlap. Where more than 16 sound at
+// once, the least needed go first: echoes and doubled notes, then the inner
+// voices of chords, then the quietest; each instrument's leading note is
+// kept longest. Speed, tempo, breaks, jumps and global volume survive on
+// another channel. A note keeps its own channel's pan and volume.
+const TM_GLOBAL = (c) => c && (c.fx === TM.SPEED || c.fx === TM.TEMPO || c.fx === 0xB || c.fx === TM.BREAK || c.fx === TM.G ||
+  c.fx === TM.H || (c.fx === 0xE && ((c.prm >> 4) === 0xE || (c.prm >> 4) === 6)));
+
+function tmPack(m, limit = 16) {
+  const timing = new Map();                            // speed and tempo where each pattern first plays
+  let sp = m.speed, te = m.tempo;
+  for (const pi of m.order) {
+    const p = m.pats[pi];
+    if (!p) continue;
+    if (!timing.has(pi)) timing.set(pi, [sp, te]);
+    for (const row of p.cells) for (const c of row) if (c) { if (c.fx === TM.SPEED) sp = c.prm; else if (c.fx === TM.TEMPO) te = c.prm; }
+  }
+  const seq = [...new Set(m.order.filter((pi) => m.pats[pi]))];
+  m.pats.forEach((p, pi) => { if (!seq.includes(pi)) seq.push(pi); });
+  const home = new Array(m.nch).fill(-1), ringing = new Array(m.nch).fill(false);
+  const cvs = m.chanVols || null, packed = new Array(m.pats.length);
+  let width = 0, lostNotes = 0, cut = 0, movedGlobal = 0;
+  const lostBy = new Map();                            // instrument -> notes left out
+  for (const pi of seq) {
+    const p = m.pats[pi], [speed, tempo] = timing.get(pi) || [m.speed, m.tempo], rowSec = speed * 2.5 / tempo;
+    // each channel's notes as segments of rows
+    const segs = [];
+    for (let ch = 0; ch < m.nch; ch++) {
+      let cur = null, inst = 0, vol = 64;
+      if (ringing[ch]) cur = { ch, start: 0, end: p.rows, note: null, inst: 0, vol: 32, hasNote: false };   // a note still sounding from before
+      for (let r = 0; r < p.rows; r++) {
+        const c = p.cells[r][ch];
+        if (!c) continue;
+        if (c.inst) inst = c.inst;
+        if (typeof c.note === 'number') {
+          if (cur) { cur.end = Math.min(cur.end, r); segs.push(cur); }
+          const s = m.samples[tmSampleFor(m, inst, c.note)];
+          vol = c.vol !== null ? c.vol : c.inst && s ? s.volume : vol;
+          let end = p.rows;
+          if (s && s.frames && !s.loopLength) {
+            const secs = s.frames / (tmRate(m, s) * 2 ** ((c.note - 60) / 12));
+            end = Math.min(end, r + Math.max(1, Math.ceil(secs / rowSec)));
+          }
+          cur = { ch, start: r, end, note: c.note, inst, vol, hasNote: true };
+        } else if (cur && (c.note === 'off' || c.vol === 0)) cur.end = Math.min(cur.end, r + 1);
+        else if (c.vol !== null) vol = c.vol;
+      }
+      if (cur) segs.push(cur);
+      ringing[ch] = !!(cur && cur.end >= p.rows && (cur.hasNote || ringing[ch]));
+    }
+    // how much each is needed
+    const byStart = new Map();
+    for (const s of segs) if (s.hasNote) { const k = s.start + ':' + s.inst; if (!byStart.has(k)) byStart.set(k, []); byStart.get(k).push(s); }
+    for (const group of byStart.values()) {
+      group.sort((a, b) => b.note - a.note || b.vol - a.vol);
+      const seen = new Set();
+      group.forEach((s, k) => {
+        s.prio = (s.vol + 1) * (k === 0 ? 3 : k === group.length - 1 ? 1 : 0.5);   // the top note leads, then the bass, then inner voices
+        if (seen.has(s.note)) s.prio *= 0.2;           // a doubled note
+        seen.add(s.note);
+      });
+    }
+    for (const s of segs) {
+      if (!s.hasNote) { s.prio = 8; continue; }
+      const echo = segs.some((e) => e !== s && e.hasNote && e.ch !== s.ch && e.inst === s.inst && e.note === s.note &&
+        e.start < s.start && s.start - e.start <= 16 && e.vol >= s.vol);
+      if (echo) s.prio *= 0.3;
+    }
+    // laid on channels: the earliest first, the most needed first among equals
+    segs.sort((a, b) => a.start - b.start || b.prio - a.prio);
+    const occ = new Array(limit).fill(null), last = new Array(limit).fill(-1), placed = [];
+    for (const s of segs) {
+      const free = (o) => !occ[o] || occ[o].end <= s.start;
+      let o = home[s.ch] >= 0 && free(home[s.ch]) ? home[s.ch] : last.findIndex((src, k) => src === s.ch && free(k));
+      if (o < 0) o = occ.findIndex((x, k) => free(k));
+      if (o < 0) {                                     // all busy: cut the note least needed now, if it is needed less
+        const now = (x) => x.prio / (1 + (s.start - x.start) / 4);   // a note that has sounded a while is needed less
+        let low = 0;
+        for (let k = 1; k < limit; k++) if (now(occ[k]) < now(occ[low])) low = k;
+        if (now(occ[low]) < s.prio) { occ[low].end = s.start; cut++; o = low; }
+      }
+      if (o < 0) {
+        if (s.hasNote) { lostNotes++; lostBy.set(s.inst, (lostBy.get(s.inst) || 0) + 1); }
+        continue;
+      }
+      s.out = o; occ[o] = s; last[o] = s.ch; home[s.ch] = o; placed.push(s);
+      width = Math.max(width, o + 1);
+    }
+    // the packed pattern
+    const cells = Array.from({ length: p.rows }, () => new Array(limit).fill(null)), outInst = new Array(limit).fill(0);
+    placed.sort((a, b) => a.start - b.start);
+    for (const s of placed) for (let r = s.start; r < s.end; r++) {
+      const c = p.cells[r][s.ch];
+      if (!c && r !== s.start) continue;
+      const out = c ? Object.assign({}, c) : { note: null, inst: 0, vol: null, volfx: 0, fx: TM_NONE, prm: 0 };
+      if (r === s.start && s.hasNote) {
+        if (!out.inst && s.inst && outInst[s.out] !== s.inst) out.inst = s.inst;
+        out.pan = m.pans[s.ch];
+        if (cvs) out.cv = cvs[s.ch];
+      }
+      if (out.inst) outInst[s.out] = out.inst;
+      if (TM_GLOBAL(c)) c.kept = true;
+      cells[r][s.out] = out;
+    }
+    for (let r = 0; r < p.rows; r++) for (let ch = 0; ch < m.nch; ch++) {   // global effects of what was left out
+      const c = p.cells[r][ch];
+      if (!TM_GLOBAL(c) || c.kept) continue;
+      const k = cells[r].findIndex((x) => !x || x.fx === TM_NONE);
+      if (k < 0) continue;
+      cells[r][k] = Object.assign(cells[r][k] || { note: null, inst: 0, vol: null, volfx: 0 }, { fx: c.fx, prm: c.prm });
+      width = Math.max(width, k + 1); movedGlobal++;
+    }
+    packed[pi] = { rows: p.rows, cells };
+  }
+  width = Math.max(1, width);
+  const out = Object.assign({}, m, { nch: width, pats: packed.map((p) => ({ rows: p.rows, cells: p.cells.map((row) => row.slice(0, width)) })),
+    pans: new Array(width).fill(128), chanVols: null });
+  out.notes = [...m.notes, `its ${m.nch} channels packed into ${width}` + (lostNotes ? `, ${lostNotes} note${lostNotes === 1 ? '' : 's'} left out where more than ${limit} sounded at once` : '')];
+  out.lost = lostNotes ? [`${lostNotes} note${lostNotes === 1 ? '' : 's'} left out where more than ${limit} sounded at once (echoes, doubled notes and inner chord voices first; ` +
+    `${cut} notes cut short). By instrument: ${[...lostBy].sort((a, b) => b[1] - a[1]).map(([i, n]) => `${(i - 1).toString(16).toUpperCase().padStart(2, '0')} (${n})`).join(', ')}.`] : [];
+  return out;
+}
+
 function tmSong(m, nch) {
   return { name: m.name, auth: '', licn: '', desc: tmLabel(m) + ' module', date: '',
     bpm: m.tempo, tpb: 24, channels: nch, voices: Array.from({ length: 16 }, (_, i) => (i < nch ? i : 0)), instruments: [], waves: [],
@@ -2230,7 +2361,7 @@ const tmLabel = (m) => ({ s3m: 'Scream Tracker 3', xm: 'FastTracker 2', it: 'Imp
 function tmPatterns(m) {
   const { keep, dropped, notes: lost, lost: missing } = tmChannels(m), song = tmSong(m, keep.length), ignored = new Map();
   const note = (k) => ignored.set(k, (ignored.get(k) || 0) + 1);
-  song.lost = missing || [];
+  song.lost = [...(m.lost || []), ...(missing || [])];
   tmInstruments(m, song, true);
   let speed = m.speed, tempo = m.tempo;
   const rows = m.pats.map((p) => {
@@ -2292,6 +2423,7 @@ function tmPatterns(m) {
           default: note({ [TM.G]: 'global volume', [TM.H]: 'global volume slide', [TM.K]: 'key off at a tick', [TM.L]: 'envelope position',
             [TM.P]: 'panning slide', [TM.R]: 'retrigger', [TM.T]: 'tremor', [TM.X]: 'extra fine portamento' }[cl.fx] || 'an effect');
         }
+        if (cl.pan !== undefined) c.raw.push(Uint8Array.of(CH.POSITION, (cl.pan - 128) & 0xFF, 0));
         if (cl.volfx) note('volume column effects');
         if (!cellEmpty(c)) pat.cells[ch][r] = c;
       }
@@ -2337,6 +2469,8 @@ function tmExact(m) {
     let trigger = false, start = 0;
     const delay = fx === 0xE && x === 0xD ? y : 0, porta = fx === 3 || fx === 5 || (cl && cl.volfx >> 4 === 0xF);
     if (cl && t === delay && rep === 0) {
+      if (cl.pan !== undefined) ch.pan = cl.pan;
+      if (cl.cv !== undefined) ch.cv = cl.cv / 64;
       if (cl.inst) {
         ch.inst = cl.inst;
         const s = m.samples[tmSampleFor(m, ch.inst, typeof cl.note === 'number' ? cl.note : ch.midi)];
@@ -2498,7 +2632,7 @@ function tmExact(m) {
   for (const f of flat) { f.endTick = tick; f.loopTick = loopTick; }
   song.tpb = 24; song.bpm = m.tempo;
   const out = bestEffort(song, flat, true);
-  out.lost = missing || [];
+  out.lost = [...(m.lost || []), ...(missing || [])];
   out.notes.unshift(`A ${m.nch}-channel ${tmLabel(m)} module, played tick by tick.`, ...m.notes.map((n) => n[0].toUpperCase() + n.slice(1) + '.'));
   if (dropped) out.notes.push(`${dropped} channels beyond 16 dropped (${lost} notes).`);
   if (ignored.size) out.notes.push('Not carried over: ' + [...ignored].map(([k, n]) => `${k} ×${n}`).join(', ') + '.');
@@ -2507,7 +2641,8 @@ function tmExact(m) {
 
 // An S3M, XM or IT file as a song: best effort, or with options.exact played tick by tick.
 function readTracked(buf, options = {}) {
-  const b = new Uint8Array(buf), m = isXm(b) ? readXm(buf) : isIt(b) ? readIt(buf) : readS3m(buf);
+  const b = new Uint8Array(buf), read = isXm(b) ? readXm(buf) : isIt(b) ? readIt(buf) : readS3m(buf);
+  const m = read.nch > 16 && options.pack !== false ? tmPack(read) : read;
   return options.exact ? tmExact(m) : tmPatterns(m);
 }
 
@@ -3653,7 +3788,9 @@ const HELP_TABS = {
       carried over); exact import plays it as ProTracker does, tick by tick. Each sample becomes an instrument playing it
       without smoothing, as the Amiga did. Scream Tracker 3 (<code>.s3m</code>) and FastTracker 2 (<code>.xm</code>) modules
       open the same way: each sample an instrument (an XM instrument's envelope fitted to its attack, decay, sustain and
-      release in best effort, played exactly in exact import), at most 16 channels. Impulse Tracker (<code>.it</code>)
+      release in best effort, played exactly in exact import). A module with more than 16 channels is packed onto 16: its
+      chords, doubled notes and echoes take turns on fewer channels, and where more than 16 notes sound at once, echoes and
+      inner chord voices go first; a notice says what was left out. Impulse Tracker (<code>.it</code>)
       modules too, compressed samples included; their new note actions, filters and pitch envelopes are not carried over.</p>
     <p>It takes MIDI files too (<code>.mid</code>, type 0 and 1). The instruments are always the same: 00-7F the 128
       General MIDI programs by name, then the drum kit, all from DMXOPL3, an OPL3 bank by Shannon Freeman (MIT licence),
